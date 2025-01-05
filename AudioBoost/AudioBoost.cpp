@@ -37,7 +37,7 @@ void get_audio_duration(const std::string& file_path) {
     if (!file.is_open()) {
         throw runtime_error("文件不存在: " + file_path);
     }
-
+   
     // 打开音频文件
     if (avformat_open_input(&format_ctx, file_path.c_str(), nullptr, nullptr) != 0) {
         throw runtime_error("无法打开输入文件: " + file_path);
@@ -93,8 +93,8 @@ void get_audio_duration(const std::string& file_path) {
 
 
 void boost_audio(const string& input_file, const string& output_file, double target_dbfs = 0.0, int segment_duration_ms = 2 * 60 * 1000) {
-    
-    
+
+
     AVFormatContext* format_ctx = nullptr;
     AVCodecContext* codec_ctx = nullptr;
     const AVCodec* codec = nullptr;
@@ -204,182 +204,124 @@ void boost_audio(const string& input_file, const string& output_file, double tar
         throw runtime_error("无法打开编码器");
     }
 
-    // 处理每个分段
-    while (av_read_frame(format_ctx, &packet) >= 0) {
-        if (packet.stream_index == audio_stream_index) {
-            int ret = avcodec_send_packet(codec_ctx, &packet);
-            if (ret < 0) {
-                char errbuf[AV_ERROR_MAX_STRING_SIZE];
-                av_strerror(ret, errbuf, sizeof(errbuf));
-                fprintf(stderr, "Error sending packet to decoder: %s\n", errbuf);
-                continue;
-            }
+    int ret = av_read_frame(format_ctx, &packet);
+    if (ret < 0) {
+        char errbuf[AV_ERROR_MAX_STRING_SIZE];
+        av_strerror(ret, errbuf, sizeof(errbuf));  // 获取错误字符串
+        fprintf(stderr, "Error reading frame: %s\n", errbuf);
+    }
+    printf("av_read_frame returned: %d\n", ret);
 
+
+    int64_t segment_start_time = 0;
+    
+    while (av_read_frame(format_ctx, &packet) >= 0) {
+        
+        if (packet.stream_index == audio_stream_index) {
+
+            int ret = avcodec_send_packet(codec_ctx, &packet);
+        
+            if (ret < 0) {
+                throw runtime_error("无法发送包到解码器");
+            
+            }
+            printf("ret: %d\n", ret);  // 注意这里是整数类型，应该使用 %d 来打印
+            
             while (ret >= 0) {
                 ret = avcodec_receive_frame(codec_ctx, frame);
                 if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
                     break;
                 }
-                else if (ret < 0) {
-                    char errbuf[AV_ERROR_MAX_STRING_SIZE];
-                    av_strerror(ret, errbuf, sizeof(errbuf));
-                    fprintf(stderr, "Error receiving frame from decoder: %s\n", errbuf);
-                    break;
+                if (ret < 0) {
+                    throw runtime_error("解码音频帧失败");
                 }
 
-                // 检查帧数据中的无效值（NaN或Inf）
-                bool contains_invalid_samples = false;
-                for (int i = 0; i < frame->nb_samples; i++) {
-                    for (int ch = 0; ch < codec_ctx->ch_layout.nb_channels; ch++) {
-                        // 获取当前样本数据指针
-                        float* sample_data = (float*)frame->extended_data[ch] + i;
+                // 检查是否到了一个新分段的末尾
+                if (segment_start_time + segment_duration_ms <= packet.pts) {
+                    // 计算当前音频段的最大 dBFS
+                    double max_dbfs = calculate_max_dbfs(frame);
 
-                        // 检查是否存在 NaN 或 Inf
-                        if (std::isnan(*sample_data) || std::isinf(*sample_data)) {
-                            contains_invalid_samples = true;
-                            break;
+                    // 计算增益
+                    double gain_needed = target_dbfs - max_dbfs;
+                    printf("Segment gain needed: %f dB\n", gain_needed);
+                    // 如果增益大于0，应用增益
+                    if (gain_needed > 0) {
+                        int num_samples = frame->nb_samples;
+            
+                        int num_channels = codecpar->ch_layout.nb_channels;
+                        
+
+                            double linear_gain = pow(10, gain_needed / 20.0); // 从dB转换为线性增益
+
+                            for (int i = 0; i < num_samples; ++i) {
+                                for (int j = 0; j < num_channels; ++j) {
+                                    int16_t* sample = (int16_t*)frame->data[j] + i;
+                                    // 计算增益：应用线性增益并防止溢出
+                                    double adjusted_sample = (*sample) * linear_gain;
+                                    *sample = static_cast<int16_t>(std::max(std::min(adjusted_sample, 32767.0), -32768.0));
+                                }
+                            }
+
+                    }
+
+                    // 将处理过的音频帧发送到编码器
+
+                    // 初始化 AVPacket
+                    AVPacket out_packet;
+                    av_init_packet(&out_packet);
+                    out_packet.data = nullptr;
+                    out_packet.size = 0;
+
+
+                    // 发送帧到编码器
+                    ret = avcodec_send_frame(out_codec_ctx, frame);
+                    if (ret < 0) {
+                        // 获取并打印详细的错误信息
+                        
+                        char errbuf[AV_ERROR_MAX_STRING_SIZE];  // 用于存储错误信息
+                        
+                        av_strerror(ret, errbuf, sizeof(errbuf));  // 将错误码转换为字符串
+                        
+                        fprintf(stderr, "Error sending frame to encoder: %s\n", errbuf);
+
+                        // 根据不同的错误类型抛出不同的异常或处理方式
+                        if (ret == AVERROR(EINVAL)) {
+                            throw runtime_error("Invalid argument passed to the encoder.");
+                        }
+                        else if (ret == AVERROR(ENOMEM)) {
+                            throw runtime_error("Memory allocation failure while sending frame.");
+                        }
+                        else if (ret == AVERROR(EAGAIN)) {
+                            throw runtime_error("The encoder is not ready to receive another frame.");
+                        }
+                        
+                        else {
+                            throw runtime_error("Unable to send frame to the encoder.");
                         }
                     }
-                    if (contains_invalid_samples) break;
-                }
 
-                if (contains_invalid_samples) {
-                    fprintf(stderr, "Frame contains invalid samples (NaN or Inf)\n");
-                    throw runtime_error("Frame contains invalid samples (NaN or Inf).");
-                }
 
-                // 处理音频帧数据（例如增益处理）
-                // boost_frame(frame);
+                    // 获取编码后的包
+                    ret = avcodec_receive_packet(out_codec_ctx, &out_packet);
+                    
+                    if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
+                        break;
+                    }
+                    if (ret < 0) {
+                        throw runtime_error("无法从编码器接收包");
+                    }
+
+                    // 写包到输出文件
+                    av_write_frame(out_format_ctx, &out_packet);
+                    av_packet_unref(&out_packet);
+
+                    // 更新分段起始时间
+                    segment_start_time = packet.pts;
+                }
             }
         }
         av_packet_unref(&packet);
     }
-
-    int64_t segment_start_time = 0;
-    //while (av_read_frame(format_ctx, &packet) >= 0) {
-    //    if (packet.stream_index == audio_stream_index) {
-    //        int ret = avcodec_send_packet(codec_ctx, &packet);
-    //        if (ret < 0) {
-    //            throw runtime_error("无法发送包到解码器");
-    //        }
-
-    //        while (ret >= 0) {
-    //            ret = avcodec_receive_frame(codec_ctx, frame);
-    //            if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
-    //                break;
-    //            }
-    //            if (ret < 0) {
-    //                throw runtime_error("解码音频帧失败");
-    //            }
-
-    //            // 检查是否到了一个新分段的末尾
-    //            if (segment_start_time + segment_duration_ms <= packet.pts) {
-    //                // 计算当前音频段的最大 dBFS
-    //                double max_dbfs = calculate_max_dbfs(frame);
-
-    //                // 计算增益
-    //                double gain_needed = target_dbfs - max_dbfs;
-
-    //                // 如果增益大于0，应用增益
-    //                if (gain_needed > 0) {
-    //                    int num_samples = frame->nb_samples;
-    //                    int num_channels = codecpar->ch_layout.nb_channels;
-    //                    for (int i = 0; i < num_samples; ++i) {
-    //                        for (int j = 0; j < num_channels; ++j) {
-    //                            int16_t* sample = (int16_t*)frame->data[j] + i;
-    //                            // 增益应用：防止溢出
-    //                            *sample = static_cast<int16_t>(std::max(std::min(*sample * gain_needed, 32767.0), -32768.0));
-    //                        }
-    //                    }
-    //                }
-
-    //                // 将处理过的音频帧发送到编码器
-
-    //                // 初始化 AVPacket
-    //                AVPacket out_packet;
-    //                av_init_packet(&out_packet);
-    //                out_packet.data = nullptr;
-    //                out_packet.size = 0;
-
-    //                // 打印调试信息：检查帧和编码器上下文的参数
-    //                printf("Sending frame to encoder...\n");
-    //                printf("Frame info:\n");
-    //                printf("  Number of samples: %d\n", frame->nb_samples);
-    //                printf("  Format: %d\n", frame->format);  // 通常为 AV_SAMPLE_FMT_S16 等
-    //                printf("  PTS: %" PRId64 "\n", frame->pts);
-    //                printf("Encoder context info:\n");
-    //                printf("  Sample rate: %d\n", out_codec_ctx->sample_rate);
-    //                printf("  Time Base: %d/%d\n", out_codec_ctx->time_base.num, out_codec_ctx->time_base.den);
-    //                printf("  Codec ID: %d\n", out_codec_ctx->codec_id);
-
-    //                // 检查音频数据是否包含 NaN 或 Inf
-    //                bool contains_invalid_samples = false;
-    //                for (int i = 0; i < frame->nb_samples; i++) {
-    //                    for (int ch = 0; ch < out_codec_ctx->ch_layout.nb_channels; ch++) {
-    //                        // 获取当前样本的数据指针，假设数据是浮点类型
-    //                        float* sample_data = (float*)frame->extended_data[ch] + i;
-
-    //                        // 检查是否存在 NaN 或 Inf
-    //                        if (std::isnan(*sample_data) || std::isinf(*sample_data)) {
-    //                            contains_invalid_samples = true;
-    //                            break;
-    //                        }
-    //                    }
-    //                    if (contains_invalid_samples) break;
-    //                }
-
-    //                if (contains_invalid_samples) {
-    //                    fprintf(stderr, "Frame contains invalid samples (NaN or Inf)\n");
-    //                    throw runtime_error("Frame contains invalid samples (NaN or Inf).");
-    //                }
-
-    //                printf(" Checked: %d\n");
-
-
-    //                // 发送帧到编码器
-    //                ret = avcodec_send_frame(out_codec_ctx, frame);
-    //                if (ret < 0) {
-    //                    // 获取并打印详细的错误信息
-    //                    char errbuf[AV_ERROR_MAX_STRING_SIZE];  // 用于存储错误信息
-    //                    av_strerror(ret, errbuf, sizeof(errbuf));  // 将错误码转换为字符串
-    //                    fprintf(stderr, "Error sending frame to encoder: %s\n", errbuf);
-
-    //                    // 根据不同的错误类型抛出不同的异常或处理方式
-    //                    if (ret == AVERROR(EINVAL)) {
-    //                        throw runtime_error("Invalid argument passed to the encoder.");
-    //                    }
-    //                    else if (ret == AVERROR(ENOMEM)) {
-    //                        throw runtime_error("Memory allocation failure while sending frame.");
-    //                    }
-    //                    else if (ret == AVERROR(EAGAIN)) {
-    //                        throw runtime_error("The encoder is not ready to receive another frame.");
-    //                    }
-    //                    else {
-    //                        throw runtime_error("Unable to send frame to the encoder.");
-    //                    }
-    //                }
-
-
-    //                // 获取编码后的包
-    //                ret = avcodec_receive_packet(out_codec_ctx, &out_packet);
-    //                if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
-    //                    break;
-    //                }
-    //                if (ret < 0) {
-    //                    throw runtime_error("无法从编码器接收包");
-    //                }
-
-    //                // 写包到输出文件
-    //                av_write_frame(out_format_ctx, &out_packet);
-    //                av_packet_unref(&out_packet);
-
-    //                // 更新分段起始时间
-    //                segment_start_time = packet.pts;
-    //            }
-    //        }
-    //    }
-    //    av_packet_unref(&packet);
-    //}
 
     // 写文件尾并清理资源
     av_write_trailer(out_format_ctx);
@@ -408,4 +350,3 @@ int main() {
 
     return 0;
 }
-
